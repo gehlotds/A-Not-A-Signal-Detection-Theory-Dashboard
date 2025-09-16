@@ -161,7 +161,7 @@ Green, D. M., & Swets, J. A. (1966). Signal detection theory and psychophysics. 
 
 ## Contact
 
-[Your contact information or GitHub profile]
+gehlotds1995@gmail.com
 
 ---
 
@@ -179,3 +179,5 @@ Green, D. M., & Swets, J. A. (1966). Signal detection theory and psychophysics. 
 - Check the Parameter Estimate Guidelines section in the app
 - Review the built-in help text and tooltips
 - Submit issues via GitHub Issues tab
+
+  ## For more information, please download the PDF Additional Information
