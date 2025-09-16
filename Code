@@ -1,0 +1,1458 @@
+# COMPLETE SDT DASHBOARD - CORRECTED UEV MLE IMPLEMENTATION (6-POINT SCALE)
+# To match SDT Assistant methodology
+
+# Install required packages (run once)
+install.packages(c("shiny", "DT", "plotly", "dplyr", "htmlwidgets", "numDeriv"))
+
+library(shiny)
+library(DT)
+library(plotly)
+library(dplyr)
+library(htmlwidgets)
+library(numDeriv)
+
+# =============================================================================
+# UNEQUAL VARIANCE MLE IMPLEMENTATION - MATCHES SDT ASSISTANT
+# =============================================================================
+
+fit_unequal_variance_mle <- function(s1_freqs, s2_freqs, max_iter = 100, tolerance = 1e-7) {
+  
+  n_categories <- length(s1_freqs)
+  s1_total <- sum(s1_freqs)
+  s2_total <- sum(s2_freqs)
+  
+  cat("=== Unequal Vartance Most Likelyhood Estimation Statistics ===\n")
+  cat("S1 frequencies:", s1_freqs, "Total:", s1_total, "\n")
+  cat("S2 frequencies:", s2_freqs, "Total:", s2_total, "\n")
+  
+  # Step 1: Calculate cumulative hit rates and false alarm rates
+  hit_rates <- numeric(n_categories)
+  false_alarm_rates <- numeric(n_categories)
+  
+  for (k in 1:n_categories) {
+    hits <- sum(s2_freqs[k:n_categories])
+    false_alarms <- sum(s1_freqs[k:n_categories])
+    hit_rates[k] <- hits / s2_total
+    false_alarm_rates[k] <- false_alarms / s1_total
+  }
+  
+  # Apply boundary corrections for initial estimates
+  hit_rates_corrected <- pmax(pmin(hit_rates[1:(n_categories-1)], 0.999), 0.001)
+  false_alarm_rates_corrected <- pmax(pmin(false_alarm_rates[1:(n_categories-1)], 0.999), 0.001)
+  
+  # Initial criteria estimates from inverse normal of FA rates
+  initial_criteria <- qnorm(false_alarm_rates_corrected)
+  initial_criteria <- sort(initial_criteria)  # Ensure ordering
+  
+  # Initial intercept/slope from regression
+  z_hits <- qnorm(hit_rates_corrected)
+  z_fas <- qnorm(false_alarm_rates_corrected)
+  
+  valid_indices <- is.finite(z_hits) & is.finite(z_fas)
+  if (sum(valid_indices) >= 2) {
+    lm_result <- lm(z_hits[valid_indices] ~ z_fas[valid_indices])
+    initial_intercept <- coef(lm_result)[1]
+    initial_slope <- coef(lm_result)[2]
+  } else {
+    initial_intercept <- 1.0
+    initial_slope <- 0.7
+  }
+  
+  # Ensure reasonable bounds
+  initial_slope <- max(0.1, min(3.0, initial_slope))
+  
+  cat("Initial criteria:", sprintf("%.3f", initial_criteria), "\n")
+  cat("Initial intercept:", sprintf("%.3f", initial_intercept), "\n")
+  cat("Initial slope:", sprintf("%.3f", initial_slope), "\n")
+  
+  # Simultaneous MLE: estimate all 7 parameters (5 criteria + intercept + slope)
+  initial_params <- c(initial_criteria, initial_intercept, initial_slope)
+  
+  # Log-likelihood function for simultaneous estimation
+  neg_log_likelihood <- function(params) {
+    
+    # Extract parameters
+    criteria <- params[1:(n_categories-1)]
+    intercept <- params[n_categories]
+    slope <- params[n_categories + 1]
+    
+    # Constraint: ensure criteria are ordered and slope > 0
+    if (any(diff(criteria) <= 0) || slope <= 0.01 || slope >= 10) {
+      return(1e10)  # Return large penalty for invalid parameters
+    }
+    
+    # Extended criteria with boundaries
+    extended_criteria <- c(-Inf, criteria, Inf)
+    
+    # Calculate probabilities for each category
+    s1_probs <- numeric(n_categories)
+    s2_probs <- numeric(n_categories)
+    
+    for (i in 1:n_categories) {
+      # S1 (noise) probabilities - standard normal
+      s1_probs[i] <- pnorm(extended_criteria[i+1]) - pnorm(extended_criteria[i])
+      
+      # S2 (signal) probabilities - transformed criteria for signal distribution
+      # z(HR) = intercept + slope * z(FAR)
+      # Transformed boundaries: (c - intercept) / slope
+      c1_transformed <- (extended_criteria[i] - intercept) / slope
+      c2_transformed <- (extended_criteria[i+1] - intercept) / slope
+      
+      s2_probs[i] <- pnorm(c2_transformed) - pnorm(c1_transformed)
+    }
+    
+    # Ensure probabilities are positive and sum to 1
+    s1_probs <- pmax(s1_probs, 1e-15)
+    s2_probs <- pmax(s2_probs, 1e-15)
+    s1_probs <- s1_probs / sum(s1_probs)
+    s2_probs <- s2_probs / sum(s2_probs)
+    
+    # Multinomial log-likelihood
+    ll <- sum(s1_freqs * log(s1_probs)) + sum(s2_freqs * log(s2_probs))
+    
+    return(-ll)  # Return negative for minimization
+  }
+  
+  # Optimize using multiple methods for robustness
+  result_nm <- tryCatch({
+    optim(par = initial_params, fn = neg_log_likelihood, 
+          method = "Nelder-Mead",
+          control = list(maxit = max_iter, reltol = tolerance))
+  }, error = function(e) {
+    list(par = initial_params, value = 1e10, convergence = 1)
+  })
+  
+  # Try L-BFGS-B with bounds for better convergence
+  n_params <- length(initial_params)
+  lower_bounds <- c(rep(-5, n_categories-1), -3, 0.1)  # criteria, intercept, slope
+  upper_bounds <- c(rep(5, n_categories-1), 3, 3)
+  
+  result_lbfgs <- tryCatch({
+    optim(par = result_nm$par, fn = neg_log_likelihood, 
+          method = "L-BFGS-B",
+          lower = lower_bounds, upper = upper_bounds,
+          control = list(maxit = max_iter, factr = tolerance * 1e12))
+  }, error = function(e) {
+    result_nm
+  })
+  
+  # Use the better result
+  result <- if (result_lbfgs$value < result_nm$value) result_lbfgs else result_nm
+  
+  # Extract final parameters
+  final_criteria <- result$par[1:(n_categories-1)]
+  final_intercept <- result$par[n_categories]
+  final_slope <- result$par[n_categories + 1]
+  
+  cat("Final criteria:", sprintf("%.3f", final_criteria), "\n")
+  cat("Final intercept:", sprintf("%.3f", final_intercept), "\n")
+  cat("Final slope:", sprintf("%.3f", final_slope), "\n")
+  cat("Convergence code:", result$convergence, "\n")
+  cat("Final log-likelihood:", sprintf("%.2f", -result$value), "\n")
+  
+  # Calculate da (sensitivity measure for Unequal Variance)
+  da <- final_intercept / sqrt((1 + final_slope^2) / 2)
+  
+  cat("Calculated da:", sprintf("%.3f", da), "\n")
+  
+  # Calculate fitted values for goodness-of-fit
+  extended_criteria <- c(-Inf, final_criteria, Inf)
+  fitted_s1_probs <- numeric(n_categories)
+  fitted_s2_probs <- numeric(n_categories)
+  
+  for (i in 1:n_categories) {
+    fitted_s1_probs[i] <- pnorm(extended_criteria[i+1]) - pnorm(extended_criteria[i])
+    
+    c1_t <- (extended_criteria[i] - final_intercept) / final_slope
+    c2_t <- (extended_criteria[i+1] - final_intercept) / final_slope
+    fitted_s2_probs[i] <- pnorm(c2_t) - pnorm(c1_t)
+  }
+  
+  fitted_s1 <- fitted_s1_probs * s1_total
+  fitted_s2 <- fitted_s2_probs * s2_total
+  
+  # Calculate fit statistics
+  chi_square_pearson <- sum((s1_freqs - fitted_s1)^2 / pmax(fitted_s1, 0.1)) + 
+    sum((s2_freqs - fitted_s2)^2 / pmax(fitted_s2, 0.1))
+  
+  # Likelihood ratio chi-square (G2)
+  ll_saturated <- 0
+  s1_nonzero <- s1_freqs > 0
+  s2_nonzero <- s2_freqs > 0
+  
+  if (any(s1_nonzero)) {
+    ll_saturated <- ll_saturated + sum(s1_freqs[s1_nonzero] * 
+                                         log(s1_freqs[s1_nonzero] / s1_total))
+  }
+  if (any(s2_nonzero)) {
+    ll_saturated <- ll_saturated + sum(s2_freqs[s2_nonzero] * 
+                                         log(s2_freqs[s2_nonzero] / s2_total))
+  }
+  
+  max_log_likelihood <- -result$value
+  chi_square_lr <- 2 * (ll_saturated - max_log_likelihood)
+  
+  # Degrees of freedom: total categories (2*6=12) - 1 - estimated parameters (7) = 4
+  # But typically for UEV: n_categories - 1 - 2 main parameters = 6 - 1 - 2 = 3
+  df <- n_categories - 3
+  
+  p_value_pearson <- 1 - pchisq(abs(chi_square_pearson), df)
+  p_value_lr <- 1 - pchisq(abs(chi_square_lr), df)
+  
+  # AIC/BIC with 7 estimated parameters
+  n_estimated_params <- n_categories + 1  # 5 criteria + intercept + slope = 7 total
+  aic <- -2 * max_log_likelihood + 2 * n_estimated_params
+  bic <- -2 * max_log_likelihood + n_estimated_params * log(s1_total + s2_total)
+  
+  cat("Chi-square (Pearson):", sprintf("%.2f", chi_square_pearson), "\n")
+  cat("Chi-square (LR/G²):", sprintf("%.2f", chi_square_lr), "\n")
+  cat("p-value (LR):", sprintf("%.3e", p_value_lr), "\n")
+  cat("AIC:", sprintf("%.2f", aic), "\n")
+  cat("=== END SDT ANALYSIS ===\n")
+  
+  return(list(
+    intercept = final_intercept,
+    slope = final_slope,
+    da = da,
+    criteria = final_criteria,
+    fitted_s1 = fitted_s1,
+    fitted_s2 = fitted_s2,
+    chi_square_pearson = chi_square_pearson,
+    chi_square_lr = chi_square_lr,
+    df = df,
+    p_value_pearson = p_value_pearson,
+    p_value_lr = p_value_lr,
+    log_likelihood = max_log_likelihood,
+    aic = aic,
+    bic = bic,
+    converged = result$convergence == 0,
+    iterations = ifelse(is.null(result$counts), 1, max(result$counts, na.rm = TRUE))
+  ))
+}
+
+# =============================================================================
+# BASIC SDT CALCULATIONS
+# =============================================================================
+
+calculate_criterion <- function(hit_rate, fa_rate) {
+  hit_rate <- pmax(pmin(hit_rate, 0.999), 0.001)
+  fa_rate <- pmax(pmin(fa_rate, 0.999), 0.001)
+  -0.5 * (qnorm(hit_rate) + qnorm(fa_rate))
+}
+
+calculate_auc <- function(hit_rates, fa_rates) {
+  if (length(hit_rates) != length(fa_rates)) return(0.5)
+  
+  order_idx <- order(fa_rates)
+  fa_sorted <- fa_rates[order_idx]
+  hr_sorted <- hit_rates[order_idx]
+  
+  if (fa_sorted[1] > 0) {
+    fa_sorted <- c(0, fa_sorted)
+    hr_sorted <- c(0, hr_sorted)
+  }
+  if (fa_sorted[length(fa_sorted)] < 1) {
+    fa_sorted <- c(fa_sorted, 1)
+    hr_sorted <- c(hr_sorted, 1)
+  }
+  
+  auc <- 0
+  for (i in 2:length(fa_sorted)) {
+    auc <- auc + (fa_sorted[i] - fa_sorted[i-1]) * (hr_sorted[i] + hr_sorted[i-1]) / 2
+  }
+  return(auc)
+}
+
+# =============================================================================
+# EXAMPLE DATA GENERATION (6-POINT ONLY)
+# =============================================================================
+
+generate_example_data <- function() {
+  # Green & Swets (1966) data from SDT Assistant
+  s1_data <- c(174, 172, 104, 92, 41, 8)
+  s2_data <- c(46, 57, 66, 101, 154, 173)
+  
+  matrix(c(s1_data, s2_data), nrow = 2, byrow = TRUE)
+}
+
+# =============================================================================
+# MAIN ANALYSIS FUNCTION
+# =============================================================================
+
+analyze_frequency_data <- function(freq_matrix) {
+  
+  s1_freqs <- as.numeric(freq_matrix[1, ])
+  s2_freqs <- as.numeric(freq_matrix[2, ])
+  
+  if (any(is.na(s1_freqs)) || any(is.na(s2_freqs))) {
+    return(list(error = "Invalid data detected. Please check your entries."))
+  }
+  
+  s1_total <- sum(s1_freqs)
+  s2_total <- sum(s2_freqs)
+  
+  if (s1_total == 0 || s2_total == 0) {
+    return(list(error = "No data entered. Please fill in the frequency table."))
+  }
+  
+  n_categories <- length(s1_freqs)
+  
+  # Calculate all ROC points for display
+  hit_rates <- numeric()
+  false_alarm_rates <- numeric()
+  
+  for (k in 1:n_categories) {
+    hits <- sum(s2_freqs[k:n_categories])
+    false_alarms <- sum(s1_freqs[k:n_categories])
+    hit_rate <- hits / s2_total
+    false_alarm_rate <- false_alarms / s1_total
+    
+    hit_rates <- c(hit_rates, hit_rate)
+    false_alarm_rates <- c(false_alarm_rates, false_alarm_rate)
+  }
+  
+  # Add endpoint (0,0)
+  hit_rates <- c(hit_rates, 0)
+  false_alarm_rates <- c(false_alarm_rates, 0)
+  
+  # Fit Unequal Variance model with corrected implementation
+  model_fit <- fit_unequal_variance_mle(s1_freqs, s2_freqs)
+  
+  if (!is.null(model_fit$error)) {
+    return(list(error = model_fit$error))
+  }
+  
+  # Select criterion 4 (should give HR ≈ 0.717 for Green & Swets data)
+  target_idx <- 4
+  if (target_idx <= length(hit_rates)) {
+    selected_hit_rate <- hit_rates[target_idx]
+    selected_fa_rate <- false_alarm_rates[target_idx]
+  } else {
+    target_idx <- which.min(abs(hit_rates[1:n_categories] - 0.7))
+    selected_hit_rate <- hit_rates[target_idx]
+    selected_fa_rate <- false_alarm_rates[target_idx]
+  }
+  
+  # Calculate criterion
+  criterion <- calculate_criterion(selected_hit_rate, selected_fa_rate)
+  
+  # Calculate AUC
+  auc <- calculate_auc(hit_rates, false_alarm_rates)
+  
+  # Create ROC data for plotting
+  roc_data <- data.frame(
+    criterion = 1:length(false_alarm_rates),
+    fa_rate = round(false_alarm_rates, 6),
+    hit_rate = round(hit_rates, 6),
+    stringsAsFactors = FALSE
+  )
+  
+  return(list(
+    da = round(model_fit$da, 4),
+    intercept = round(model_fit$intercept, 4),
+    slope = round(model_fit$slope, 4),
+    criterion = round(criterion, 4),
+    auc = round(auc, 6),
+    hit_rate = round(selected_hit_rate, 4),
+    fa_rate = round(selected_fa_rate, 4),
+    roc_data = roc_data,
+    freq_matrix = freq_matrix,
+    s1_total = s1_total,
+    s2_total = s2_total,
+    model_fit = model_fit
+  ))
+}
+
+# =============================================================================
+# SHINY UI
+# =============================================================================
+
+ui <- fluidPage(
+  titlePanel("Complete A-Not A Signal Detection Analysis - 6-Point Rating Scale"),
+  
+  # Custom CSS for styling
+  tags$head(
+    tags$style(HTML("
+      .data-input-section {
+        background-color: #f8f9fa;
+        padding: 20px;
+        border-radius: 10px;
+        margin: 15px 0;
+        border: 2px solid #e9ecef;
+      }
+      
+      .grid-header {
+        font-weight: bold;
+        text-align: center;
+        background-color: #6c757d;
+        color: white;
+        padding: 8px;
+        font-size: 12px;
+      }
+      
+      .stimulus-label {
+        font-weight: bold;
+        background-color: #007bff;
+        color: white;
+        text-align: center;
+        padding: 8px;
+        vertical-align: middle;
+      }
+      
+      .results-box {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 5px;
+        text-align: center;
+      }
+      
+      .metric-value {
+        font-size: 2em;
+        font-weight: bold;
+        margin: 5px 0;
+      }
+      
+      .metric-label {
+        font-size: 0.9em;
+        opacity: 0.9;
+      }
+      
+      .help-text {
+        background-color: #e7f3ff;
+        border: 1px solid #b3d9ff;
+        border-radius: 5px;
+        padding: 10px;
+        margin: 10px 0;
+      }
+      
+      .example-button {
+        background-color: #28a745;
+        color: white;
+        border: none;
+        padding: 8px 15px;
+        border-radius: 5px;
+        cursor: pointer;
+        margin: 5px;
+      }
+      
+      .clear-button {
+        background-color: #dc3545;
+        color: white;
+        border: none;
+        padding: 8px 15px;
+        border-radius: 5px;
+        cursor: pointer;
+        margin: 5px;
+      }
+      
+      .plot-container {
+        background: white;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        transition: box-shadow 0.3s ease;
+      }
+      
+      .plot-container:hover {
+        box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+      }
+      
+      .scale-explanation {
+        background-color: #f0f8ff;
+        border: 2px solid #4169E1;
+        border-radius: 8px;
+        padding: 15px;
+        margin: 15px 0;
+      }
+      
+      .fit-stats {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 5px;
+        padding: 10px;
+        margin: 10px 0;
+        font-family: monospace;
+        font-size: 12px;
+      }
+      
+      .success-box {
+        background-color: #d4edda;
+        border: 1px solid #c3e6cb;
+        border-radius: 5px;
+        padding: 10px;
+        margin: 10px 0;
+        color: #155724;
+      }
+      
+      .estimate-notes {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        padding: 15px;
+        margin: 30px 0;
+        font-size: 12px;
+        line-height: 1.4;
+        max-height: 600px;
+        overflow-y: auto;
+      }
+      
+      .estimate-notes h4 {
+        color: #495057;
+        margin-top: 15px;
+        margin-bottom: 8px;
+        font-size: 14px;
+      }
+      
+      .estimate-notes h4:first-child {
+        margin-top: 0;
+      }
+      
+      .estimate-notes ul {
+        margin: 5px 0;
+        padding-left: 15px;
+      }
+      
+      .estimate-notes li {
+        margin: 3px 0;
+      }
+      
+      .estimate-notes strong {
+        color: #007bff;
+      }
+      
+      .estimate-notes em {
+        color: #6c757d;
+        font-style: italic;
+      }
+      
+      .interpretation-section {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        padding: 15px;
+        margin: 15px 0;
+        font-size: 12px;
+        line-height: 1.4;
+        max-height: 500px;
+        overflow-y: auto;
+      }
+      
+      .interpretation-section h4 {
+        color: #495057;
+        margin-top: 10px;
+        margin-bottom: 8px;
+        font-size: 14px;
+      }
+      
+      .interpretation-section h5 {
+        color: #667eea;
+        margin-top: 8px;
+        margin-bottom: 6px;
+        font-size: 13px;
+      }
+    "))
+  ),
+  
+  sidebarLayout(
+    sidebarPanel(
+      width = 4,
+      
+      h3("A-Not A Configuration"),
+      
+      div(class = "help-text",
+          p(strong("Model:"), " Unequal Variance (UEV: YN LR/Beta)"),
+          p(strong("Rating Scale:"), " 6-Point Confidence Rating"),
+          p(strong("Step 1:"), " Enter your frequency data in the table below.")
+      ),
+      
+      br(),
+      
+      # Action buttons
+      div(style = "text-align: center;",
+          actionButton("loadExample", 
+                       "Load Example Data", 
+                       class = "example-button"),
+          actionButton("clearData", 
+                       "Clear All", 
+                       class = "clear-button")
+      ),
+      
+      br(),
+      
+      # Analysis button
+      actionButton("analyzeBtn", 
+                   "Run SDT Analysis (UEV)", 
+                   class = "btn-primary btn-lg",
+                   style = "width: 100%; margin-top: 15px;"),
+      
+      hr(),
+      
+      # Instructions
+      div(class = "help-text",
+          h4("Instructions:"),
+          tags$ol(
+            tags$li("Enter frequency data in the 6-point rating table"),
+            tags$li("S1 = responses when 'Not A' was presented"),
+            tags$li("S2 = responses when 'A' was presented"),
+            tags$li("Higher numbers = higher confidence in 'A' responses"),
+            tags$li("Click 'Run Analysis' to see UEV results!")
+          )
+      ),
+      
+      br(),
+      
+      # Model information
+      div(class = "success-box",
+          h4("Model Information:"),
+          p("Using corrected Unequal-Variance Normal model with simultaneous Most Likely Estimation of all parameters.")
+      ),
+      
+      # Results Interpretation (moved from main panel)
+      conditionalPanel(
+        condition = "output.showResults",
+        div(class = "interpretation-section",
+            h4("Results Interpretation"),
+            htmlOutput("interpretation")
+        )
+      ),
+      
+      # Parameter Estimate Notes
+      div(class = "estimate-notes",
+          h3("Parameter Estimate Guidelines", style = "color: #495057; margin-bottom: 15px; font-size: 16px;"),
+          
+          h4("1. Sensitivity (da or d′)"),
+          tags$ul(
+            tags$li(strong("Typical Range for Success:")),
+            tags$ul(
+              tags$li(tags$em("da"), " or ", tags$em("d′"), " values greater than 1 generally indicate good sensory discrimination."),
+              tags$li("Values between 1.0 to 2.5 are typical for moderately to highly discriminable stimuli."),
+              tags$li("Values below 0.5 suggest poor or chance discrimination.")
+            ),
+            tags$li(strong("Interpretation:")),
+            tags$ul(
+              tags$li("Higher sensitivity means the panel can reliably distinguish 'A' from 'Not A'."),
+              tags$li("Threshold for practical significance often depends on context but ", tags$em("d′>1"), " is often considered meaningful.")
+            ),
+            tags$li(strong("Calculation:")),
+            tags$ul(
+              tags$li("Derived from simultaneous MLE fitting of all parameters."),
+              tags$li("Formula: da = intercept / √((1 + slope²) / 2)")
+            ),
+            tags$li(strong("Test Objective:")),
+            tags$ul(
+              tags$li("Measures true ability to detect a difference regardless of bias.")
+            )
+          ),
+          
+          h4("2. Intercept (ROC curve)"),
+          tags$ul(
+            tags$li(strong("Typical Range:")),
+            tags$ul(
+              tags$li("Usually positive when discrimination exists; roughly aligns with d' in good fitting UnEqual Variance models.")
+            ),
+            tags$li(strong("Interpretation:")),
+            tags$ul(
+              tags$li("Reflects signal-to-noise mean separation on the internal evidence scale.")
+            ),
+            tags$li(strong("Significance:")),
+            tags$ul(
+              tags$li("A larger intercept indicates a clearer perceptual difference and is a key component for calculating the da score. In the simpler Equal Variance model, this value would be identical to d' (EV)or da (UEV)")
+            )
+          ),
+          
+          h4("3. Slope (ROC curve)"),
+          tags$ul(
+            tags$li(strong("Typical Range:")),
+            tags$ul(
+              tags$li("Equal to 1 in Equal Variance (EV) model (perfect match of signal/noise variance)."),
+              tags$li("Between 0.5 and 1.5 commonly observed in Unequal Variance (UEV) models.")
+            ),
+            tags$li(strong("Interpretation:")),
+            tags$ul(
+              tags$li("Deviation from 1 suggests variance differences between signal and noise distributions.")
+            ),
+            tags$li(strong("Significance:")),
+            tags$ul(
+              tags$li("Critical for proper modeling; ignoring slope deviations leads to biased estimates.")
+            )
+          ),
+          
+          h4("4. Criterion (Decision Thresholds)"),
+          tags$ul(
+            tags$li(strong("Typical Range:")),
+            tags$ul(
+              tags$li("Criteria separating 6 rating categories typically range between roughly −3 and +3."),
+              tags$li("Close to 0 indicates balanced decision boundaries.")
+            ),
+            tags$li(strong("Interpretation:")),
+            tags$ul(
+              tags$li("Show how confident or conservative participants are in labeling stimuli."),
+              tags$li("Biased panels show criteria shifted asymmetrically.")
+            ),
+            tags$li(strong("Significance:")),
+            tags$ul(
+              tags$li("Analyzing criteria is essential for understanding panel behavior and response bias, which goes beyond just the panel's ability to detect a difference.")
+            )
+          ),
+          
+          h4("5. Area Under Curve (AUC)"),
+          tags$ul(
+            tags$li(strong("Typical Range:")),
+            tags$ul(
+              tags$li("0.5 indicates random chance (poor test)"),
+              tags$li("Closer to 1.0 indicates near perfect discrimination"),
+              tags$li("Successful A-not-A tests usually have AUC ≥0.75")
+            ),
+            tags$li(strong("Interpretation:")),
+            tags$ul(
+              tags$li("Overall discrimination quality independent of bias.")
+            ),
+            tags$li(strong("Significance:")),
+            tags$ul(
+              tags$li("Useful single number summary for performance comparison.")
+            )
+          ),
+          
+          h4("6. Fit Statistics (G², Chi-square, p-values, AIC, BIC)"),
+          tags$ul(
+            tags$li(strong("Desired Outcome:")),
+            tags$ul(
+              tags$li("High p-values (e.g., ", tags$em("p>0.05"), ") indicate acceptable model fit."),
+              tags$li("Low values of G² and Chi-square suggest observed data matches model predictions.")
+            ),
+            tags$li(strong("Interpretation:")),
+            tags$ul(
+              tags$li("Ensures model-based estimates are valid and reliable.")
+            ),
+            tags$li(strong("Significance:")),
+            tags$ul(
+              tags$li("Essential for trustworthiness of other parameter estimates.")
+            )
+          ),
+          
+          h4("Practical Notes for Success"),
+          tags$ul(
+            tags$li("Sensitivity (da or d′) above 1 combined with well-distributed criteria and good model fit p-values indicates success."),
+            tags$li("Heavily skewed criteria (> +2 or < -2) may indicate panel bias or inconsistent strategies."),
+            tags$li("Extreme slope values (<0.5 or >1.5) suggest UEV model is necessary over equal variance assumptions.")
+          )
+      )
+    ),
+    
+    mainPanel(
+      width = 8,
+      
+      # Data input section
+      div(class = "data-input-section",
+          fluidRow(
+            column(12,
+                   h3("Enter Your A-Not A Frequency Data (6-Point Category Scale)"),
+                   
+                   div(class = "help-text",
+                       p(strong("Step 2:"), " Enter frequency counts for each combination."),
+                       p(strong("Example:"), " If 173 participants gave response '6' (Sure it is A) when 'A' was presented, enter 173 in S2 row, column 6.")
+                   ),
+                   
+                   br(),
+                   
+                   # Fixed 6-point data input table
+                   tags$table(
+                     class = "table table-bordered",
+                     style = "margin: auto;",
+                     
+                     # Header row
+                     tags$tr(
+                       tags$th("", class = "grid-header", style = "width: 120px;"),
+                       tags$th("1 (Sure Not A)", class = "grid-header", style = "width: 120px;"),
+                       tags$th("2 (Think Not A)", class = "grid-header", style = "width: 120px;"),
+                       tags$th("3 (Slightly Not A)", class = "grid-header", style = "width: 120px;"),
+                       tags$th("4 (Slightly A)", class = "grid-header", style = "width: 120px;"),
+                       tags$th("5 (Think A)", class = "grid-header", style = "width: 120px;"),
+                       tags$th("6 (Sure A)", class = "grid-header", style = "width: 120px;")
+                     ),
+                     
+                     # S1 (Not A) row
+                     tags$tr(
+                       tags$td("S1 (Not A)", class = "stimulus-label"),
+                       tags$td(numericInput("s1_1", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s1_2", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s1_3", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s1_4", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s1_5", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s1_6", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;")
+                     ),
+                     
+                     # S2 (A) row  
+                     tags$tr(
+                       tags$td("S2 (A)", class = "stimulus-label"),
+                       tags$td(numericInput("s2_1", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s2_2", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s2_3", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s2_4", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s2_5", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;"),
+                       tags$td(numericInput("s2_6", label = NULL, value = 0, min = 0, step = 1, width = "70px"),
+                               style = "text-align: center; padding: 5px;")
+                     )
+                   ),
+                   
+                   br(),
+                   
+                   # Data summary
+                   htmlOutput("dataSummary")
+            )
+          )
+      ),
+      
+      # Results section - only show after analysis
+      conditionalPanel(
+        condition = "output.showResults",
+        
+        # Key metrics boxes
+        fluidRow(
+          column(3, div(class = "results-box",
+                        div(class = "metric-value", textOutput("daOut")),
+                        div(class = "metric-label", "da (UEV)"))),
+          column(3, div(class = "results-box",
+                        div(class = "metric-value", textOutput("aucOut")),
+                        div(class = "metric-label", "AUC"))),
+          column(3, div(class = "results-box",
+                        div(class = "metric-value", textOutput("criterionOut")),
+                        div(class = "metric-label", "Criterion (c)"))),
+          column(3, div(class = "results-box",
+                        div(class = "metric-value", textOutput("hitRateOut")),
+                        div(class = "metric-label", "Hit Rate")))
+        ),
+        
+        br(),
+        
+        # Additional metrics
+        fluidRow(
+          column(4, div(class = "results-box",
+                        div(class = "metric-value", textOutput("interceptOut")),
+                        div(class = "metric-label", "Intercept"))),
+          column(4, div(class = "results-box",
+                        div(class = "metric-value", textOutput("slopeOut")),
+                        div(class = "metric-label", "Slope"))),
+          column(4, div(class = "results-box",
+                        div(class = "metric-value", textOutput("faRateOut")),
+                        div(class = "metric-label", "False Alarm Rate")))
+        ),
+        
+        br(),
+        
+        # Fit Statistics with UEV results
+        fluidRow(
+          column(12,
+                 wellPanel(
+                   h4("Model Fit Statistics (SDT Assistant Compatible)"),
+                   htmlOutput("fitStats")
+                 ))
+        ),
+        
+        # INTERACTIVE PLOTS
+        fluidRow(
+          column(6,
+                 wellPanel(
+                   h4("ROC Curve"),
+                   div(class = "plot-container",
+                       plotlyOutput("rocPlot", height = "400px"))
+                 )),
+          column(6,
+                 wellPanel(
+                   h4("SDT Distribution Curves"),
+                   div(class = "plot-container",
+                       plotlyOutput("distPlot", height = "400px"))
+                 ))
+        ),
+        
+        # ROC Data Table and Analysis Log
+        fluidRow(
+          column(6,
+                 wellPanel(
+                   h4("ROC Points Data"),
+                   DT::dataTableOutput("rocTable", height = "300px")
+                 )),
+          column(6,
+                 wellPanel(
+                   h4("Analysis Log"),
+                   verbatimTextOutput("consoleOutput")
+                 ))
+        )
+      )
+    )
+  )
+)
+
+# =============================================================================
+# SHINY SERVER
+# =============================================================================
+
+server <- function(input, output, session) {
+  
+  values <- reactiveValues(
+    freq_data = NULL,
+    results = NULL,
+    show_results = FALSE,
+    console_text = ""
+  )
+  
+  # Load example data
+  observeEvent(input$loadExample, {
+    example_data <- generate_example_data()
+    
+    # Update input fields with Green & Swets (1966) data
+    updateNumericInput(session, "s1_1", value = example_data[1, 1])
+    updateNumericInput(session, "s1_2", value = example_data[1, 2])
+    updateNumericInput(session, "s1_3", value = example_data[1, 3])
+    updateNumericInput(session, "s1_4", value = example_data[1, 4])
+    updateNumericInput(session, "s1_5", value = example_data[1, 5])
+    updateNumericInput(session, "s1_6", value = example_data[1, 6])
+    
+    updateNumericInput(session, "s2_1", value = example_data[2, 1])
+    updateNumericInput(session, "s2_2", value = example_data[2, 2])
+    updateNumericInput(session, "s2_3", value = example_data[2, 3])
+    updateNumericInput(session, "s2_4", value = example_data[2, 4])
+    updateNumericInput(session, "s2_5", value = example_data[2, 5])
+    updateNumericInput(session, "s2_6", value = example_data[2, 6])
+    
+    showNotification("Green & Swets (1966) data loaded! Click 'Run Analysis' for SDT Assistant compatible results.", 
+                     type = "message", duration = 4)
+  })
+  
+  # Clear data
+  observeEvent(input$clearData, {
+    for (i in 1:6) {
+      updateNumericInput(session, paste0("s1_", i), value = 0)
+      updateNumericInput(session, paste0("s2_", i), value = 0)
+    }
+    
+    values$show_results <- FALSE
+    showNotification("Data cleared.", type = "message")
+  })
+  
+  # Data summary
+  output$dataSummary <- renderUI({
+    s1_total <- 0
+    s2_total <- 0
+    
+    for (i in 1:6) {
+      s1_val <- input[[paste0("s1_", i)]]
+      s2_val <- input[[paste0("s2_", i)]]
+      
+      if (!is.null(s1_val)) s1_total <- s1_total + s1_val
+      if (!is.null(s2_val)) s2_total <- s2_total + s2_val
+    }
+    
+    HTML(paste0(
+      "<div style='background-color: #f8f9fa; padding: 10px; border-radius: 5px; text-align: center;'>",
+      "<strong>Data Summary:</strong> ",
+      "S1 (Not A) trials: ", s1_total, " | ",
+      "S2 (A) trials: ", s2_total, " | ",
+      "Total trials: ", s1_total + s2_total,
+      "</div>"
+    ))
+  })
+  
+  # Run analysis with corrected Unequal Variance
+  observeEvent(input$analyzeBtn, {
+    
+    console_output <- capture.output({
+      
+      # Collect data from inputs (fixed 6 categories)
+      s1_data <- numeric(6)
+      s2_data <- numeric(6)
+      
+      for (i in 1:6) {
+        s1_val <- input[[paste0("s1_", i)]]
+        s2_val <- input[[paste0("s2_", i)]]
+        
+        s1_data[i] <- if (is.null(s1_val) || is.na(s1_val)) 0 else as.numeric(s1_val)
+        s2_data[i] <- if (is.null(s2_val) || is.na(s2_val)) 0 else as.numeric(s2_val)
+      }
+      
+      # Check for valid data
+      if (sum(s1_data) == 0 && sum(s2_data) == 0) {
+        cat("Please enter some frequency data before running analysis.\n")
+        return()
+      }
+      
+      if (sum(s1_data) == 0) {
+        cat("S1 (Not A) data is empty. Please enter frequencies for both stimulus types.\n")
+        return()
+      }
+      
+      if (sum(s2_data) == 0) {
+        cat("S2 (A) data is empty. Please enter frequencies for both stimulus types.\n")
+        return()
+      }
+      
+      # Create frequency matrix
+      freq_matrix <- rbind(s1_data, s2_data)
+      rownames(freq_matrix) <- c("S1 (Not A)", "S2 (A)")
+      colnames(freq_matrix) <- paste("Rating", 1:6)
+      
+      # Analyze with corrected implementation
+      results <- analyze_frequency_data(freq_matrix)
+      
+      if (!is.null(results$error)) {
+        cat("ERROR:", results$error, "\n")
+        return()
+      }
+      
+      # Check for valid results
+      if (is.na(results$da) || is.infinite(results$da)) {
+        cat("Analysis produced invalid results. Please check your data.\n")
+        return()
+      }
+      
+      values$results <- results
+      values$show_results <- TRUE
+      
+    })
+    
+    values$console_text <- paste(console_output, collapse = "\n")
+    
+    if (!is.null(values$results) && is.null(values$results$error)) {
+      # Check if we got close to expected results for Green & Swets data
+      expected_da <- 1.239
+      expected_intercept <- 1.072
+      expected_slope <- 0.7058
+      
+      da_match <- abs(values$results$da - expected_da) < 0.05
+      intercept_match <- abs(values$results$intercept - expected_intercept) < 0.05
+      slope_match <- abs(values$results$slope - expected_slope) < 0.05
+      
+      if (da_match && intercept_match && slope_match) {
+        showNotification("SUCCESS: Results closely match SDT Assistant benchmark values!", 
+                         type = "message", duration = 4)
+      } else {
+        showNotification("Unequal Variance analysis completed. Check parameter values against benchmarks.", 
+                         type = "warning", duration = 4)
+      }
+    } else if (!is.null(values$results$error)) {
+      showNotification(paste("Analysis error:", values$results$error), type = "error", duration = 8)
+    }
+  })
+  
+  # Show results flag
+  output$showResults <- reactive({
+    values$show_results
+  })
+  outputOptions(output, "showResults", suspendWhenHidden = FALSE)
+  
+  # Results outputs
+  output$daOut <- renderText({
+    if (is.null(values$results)) return("---")
+    sprintf("%.3f", values$results$da)
+  })
+  
+  output$aucOut <- renderText({
+    if (is.null(values$results)) return("---")
+    sprintf("%.3f", values$results$auc)
+  })
+  
+  output$criterionOut <- renderText({
+    if (is.null(values$results)) return("---")
+    sprintf("%.3f", values$results$criterion)
+  })
+  
+  output$hitRateOut <- renderText({
+    if (is.null(values$results)) return("---")
+    sprintf("%.3f", values$results$hit_rate)
+  })
+  
+  output$interceptOut <- renderText({
+    if (is.null(values$results)) return("---")
+    sprintf("%.3f", values$results$intercept)
+  })
+  
+  output$slopeOut <- renderText({
+    if (is.null(values$results)) return("---")
+    sprintf("%.3f", values$results$slope)
+  })
+  
+  output$faRateOut <- renderText({
+    if (is.null(values$results)) return("---")
+    sprintf("%.3f", values$results$fa_rate)
+  })
+  
+  # Fit Statistics Output
+  output$fitStats <- renderUI({
+    req(values$results)
+    
+    model_fit <- values$results$model_fit
+    
+    HTML(paste0(
+      "<div class='fit-stats'>",
+      "<strong>Model:</strong> Unequal-Variance Normal (UEV: YN LR/Beta)<br>",
+      "<strong>Simultaneous Maximum Likelihood Estimation:</strong><br>",
+      sprintf("Chi-square (Pearson): %.2f<br>", model_fit$chi_square_pearson),
+      sprintf("Chi-square (LR/G²): %.2f<br>", model_fit$chi_square_lr),
+      sprintf("Degrees of Freedom: %d<br>", model_fit$df),
+      sprintf("p-value (Pearson): %.3e<br>", model_fit$p_value_pearson),
+      sprintf("p-value (LR): %.3e<br>", model_fit$p_value_lr),
+      sprintf("Log-Likelihood: %.2f<br>", model_fit$log_likelihood),
+      sprintf("AIC: %.2f<br>", model_fit$aic),
+      sprintf("BIC: %.2f<br>", model_fit$bic),
+      sprintf("Converged: %s<br>", ifelse(model_fit$converged, "Yes", "No")),
+      sprintf("Iterations: %d<br>", model_fit$iterations),
+      "<br><strong>Parameters (Simultaneous Estimation):</strong><br>",
+      sprintf("da (sensitivity): %.3f<br>", values$results$da),
+      sprintf("Intercept: %.3f<br>", values$results$intercept),
+      sprintf("Slope: %.3f<br>", values$results$slope),
+      sprintf("Criteria: [%s]<br>", paste(sprintf("%.3f", model_fit$criteria), collapse=", ")),
+      "</div>"
+    ))
+  })
+  
+  # ROC Plot
+  output$rocPlot <- renderPlotly({
+    req(values$results)
+    
+    tryCatch({
+      roc_data <- values$results$roc_data
+      
+      # Validate data
+      if (any(is.na(roc_data$fa_rate)) || any(is.na(roc_data$hit_rate))) {
+        return(plotly_empty() %>% 
+                 layout(annotations = list(text = "Error: Invalid data for ROC curve", 
+                                           x = 0.5, y = 0.5, showarrow = FALSE)))
+      }
+      
+      # Pre-calculate values
+      da_val <- values$results$da
+      auc_val <- values$results$auc
+      
+      # Create criterion labels
+      criterion_labels <- paste("Criterion", roc_data$criterion)
+      
+      # Create interactive plotly ROC curve
+      p <- plot_ly() %>%
+        
+        # Main ROC curve
+        add_trace(
+          data = roc_data,
+          x = ~fa_rate, 
+          y = ~hit_rate,
+          type = 'scatter',
+          mode = 'lines+markers',
+          line = list(color = '#667eea', width = 4),
+          marker = list(color = '#764ba2', size = 10, opacity = 0.8),
+          hovertemplate = paste0(
+            "<b>%{text}</b><br>",
+            "False Alarm Rate: %{x:.3f}<br>", 
+            "Hit Rate: %{y:.3f}<br>",
+            "da (UEV): ", round(da_val, 3), "<br>",
+            "AUC: ", round(auc_val, 3), "<br>",
+            "<extra></extra>"
+          ),
+          text = criterion_labels,
+          name = "ROC Curve"
+        ) %>%
+        
+        # Add chance line
+        add_trace(
+          x = c(0, 1), 
+          y = c(0, 1),
+          type = 'scatter', 
+          mode = 'lines',
+          line = list(color = 'gray', width = 2, dash = 'dash'),
+          hovertemplate = "Chance Line<br>AUC = 0.500<extra></extra>",
+          name = "Chance Line"
+        ) %>%
+        
+        # Layout styling
+        layout(
+          xaxis = list(
+            title = "<b>False Alarm Rate</b><br><i>P(Say 'A' | Not A presented)</i>",
+            titlefont = list(size = 14),
+            range = c(0, 1),
+            showgrid = TRUE,
+            gridcolor = 'rgba(128, 128, 128, 0.3)'
+          ),
+          yaxis = list(
+            title = "<b>Hit Rate</b><br><i>P(Say 'A' | A presented)</i>",
+            titlefont = list(size = 14),
+            range = c(0, 1),
+            showgrid = TRUE,
+            gridcolor = 'rgba(128, 128, 128, 0.3)'
+          ),
+          plot_bgcolor = 'rgba(245, 245, 245, 0.8)',
+          paper_bgcolor = 'white',
+          hovermode = 'closest',
+          showlegend = TRUE
+        ) %>%
+        
+        # Configuration options
+        config(
+          displayModeBar = TRUE,
+          displaylogo = FALSE,
+          toImageButtonOptions = list(
+            format = 'png',
+            filename = 'ROC_curve_corrected_UEV',
+            height = 500,
+            width = 700,
+            scale = 2
+          )
+        )
+      
+      return(p)
+      
+    }, error = function(e) {
+      cat("ROC Plot Error:", e$message, "\n")
+      return(plotly_empty() %>% 
+               layout(annotations = list(text = paste("Plot Error:", e$message), 
+                                         x = 0.5, y = 0.5, showarrow = FALSE)))
+    })
+  })
+  
+  # SDT Distribution Plot
+  output$distPlot <- renderPlotly({
+    req(values$results)
+    
+    tryCatch({
+      da_val <- values$results$da
+      slope_val <- values$results$slope
+      
+      # Create x-axis values
+      x_range <- seq(-4, max(4, da_val + 4), length.out = 200)
+      
+      # Calculate the two distributions for Unequal Variance
+      # Noise distribution (standard normal)
+      noise_dist <- dnorm(x_range, mean = 0, sd = 1)
+      
+      # Signal distribution (different variance in UEV model)
+      # In UEV model, signal distribution has sd = 1/slope
+      signal_sd <- ifelse(abs(slope_val) > 1e-6, 1/abs(slope_val), 1)
+      signal_mean <- da_val * sqrt((1 + slope_val^2) / 2)  # Adjusted for UEV
+      signal_dist <- dnorm(x_range, mean = signal_mean, sd = signal_sd)
+      
+      # Normalize for plotting
+      scaling_factor <- 0.4 * sqrt(2 * pi)
+      noise_dist <- noise_dist * scaling_factor
+      signal_dist <- signal_dist * scaling_factor
+      
+      # Create the plotly distribution plot
+      p <- plot_ly() %>%
+        
+        # Noise distribution
+        add_trace(
+          x = x_range,
+          y = noise_dist,
+          type = 'scatter',
+          mode = 'lines',
+          name = 'Noise',
+          line = list(color = '#e74c3c', width = 3, dash = 'dash'),
+          hovertemplate = paste0(
+            "<b>Noise Distribution</b><br>",
+            "Evidence: %{x:.2f}<br>",
+            "Density: %{y:.3f}<br>",
+            "SD: 1.0<br>",
+            "<extra></extra>"
+          )
+        ) %>%
+        
+        # Signal distribution
+        add_trace(
+          x = x_range,
+          y = signal_dist,
+          type = 'scatter',
+          mode = 'lines',
+          name = 'Signal',
+          line = list(color = '#3498db', width = 3),
+          hovertemplate = paste0(
+            "<b>Signal Distribution</b><br>",
+            "Evidence: %{x:.2f}<br>",
+            "Density: %{y:.3f}<br>",
+            "SD: ", round(signal_sd, 3), "<br>",
+            "<extra></extra>"
+          )
+        ) %>%
+        
+        # Add annotations
+        add_annotations(
+          x = signal_mean/2,
+          y = 0.6,
+          text = paste0("<b>da = ", round(da_val, 3), "</b><br>Slope = ", round(slope_val, 3)),
+          showarrow = TRUE,
+          arrowhead = 2,
+          arrowsize = 1,
+          arrowwidth = 2,
+          arrowcolor = "#2c3e50",
+          ax = 0,
+          ay = -40,
+          font = list(size = 14, color = "#2c3e50")
+        ) %>%
+        
+        # Layout styling
+        layout(
+          xaxis = list(
+            title = "<b>Intensity</b>",
+            titlefont = list(size = 14),
+            showgrid = TRUE,
+            gridcolor = 'rgba(128, 128, 128, 0.3)',
+            zeroline = TRUE,
+            zerolinecolor = 'rgba(128, 128, 128, 0.6)',
+            zerolinewidth = 2
+          ),
+          yaxis = list(
+            title = "<b>Probability Density</b>",
+            titlefont = list(size = 14),
+            showgrid = TRUE,
+            gridcolor = 'rgba(128, 128, 128, 0.3)',
+            range = c(0, 0.8)
+          ),
+          plot_bgcolor = 'rgba(245, 245, 245, 0.8)',
+          paper_bgcolor = 'white',
+          hovermode = 'closest',
+          showlegend = TRUE
+        ) %>%
+        
+        # Configuration
+        config(
+          displayModeBar = TRUE,
+          displaylogo = FALSE,
+          toImageButtonOptions = list(
+            format = 'png',
+            filename = 'sdt_distributions_corrected_UEV',
+            height = 500,
+            width = 700,
+            scale = 2
+          )
+        )
+      
+      return(p)
+      
+    }, error = function(e) {
+      cat("Distribution Plot Error:", e$message, "\n")
+      return(plotly_empty() %>% 
+               layout(annotations = list(text = paste("Plot Error:", e$message), 
+                                         x = 0.5, y = 0.5, showarrow = FALSE)))
+    })
+  })
+  
+  # ROC Data Table
+  output$rocTable <- DT::renderDataTable({
+    req(values$results)
+    
+    DT::datatable(
+      values$results$roc_data,
+      options = list(
+        pageLength = 8,
+        dom = 't',
+        scrollY = "250px",
+        scrollCollapse = TRUE
+      ),
+      rownames = FALSE
+    ) %>%
+      DT::formatRound(columns = c("fa_rate", "hit_rate"), digits = 3)
+  })
+  
+  # Console Output
+  output$consoleOutput <- renderText({
+    values$console_text
+  })
+  
+  # Interpretation
+  output$interpretation <- renderUI({
+    req(values$results)
+    
+    results <- values$results
+    
+    # Interpretation logic
+    da_interp <- if (results$da < 0.5) {
+      "Poor sensitivity - difficulty distinguishing A from Not A"
+    } else if (results$da < 1.0) {
+      "Moderate sensitivity - some ability to distinguish"
+    } else if (results$da < 2.0) {
+      "Good sensitivity - clear discrimination ability" 
+    } else {
+      "Excellent sensitivity - very strong discrimination"
+    }
+    
+    auc_interp <- if (results$auc < 0.6) {
+      "Poor discrimination (near chance)"
+    } else if (results$auc < 0.7) {
+      "Fair discrimination"
+    } else if (results$auc < 0.8) {
+      "Good discrimination"
+    } else if (results$auc < 0.9) {
+      "Very good discrimination"
+    } else {
+      "Excellent discrimination"
+    }
+    
+    bias_interp <- if (abs(results$criterion) < 0.2) {
+      "No response bias - neutral responding"
+    } else if (results$criterion < -0.5) {
+      "Strong liberal bias - tends to say 'A'"
+    } else if (results$criterion < 0) {
+      "Moderate liberal bias - slightly favors 'A'"
+    } else if (results$criterion > 0.5) {
+      "Strong conservative bias - tends to say 'Not A'"
+    } else {
+      "Moderate conservative bias - slightly favors 'Not A'"
+    }
+    
+    slope_interp <- if (abs(results$slope - 1) < 0.1) {
+      "Signal and noise distributions have similar variances (near Equal Variance)"
+    } else if (results$slope < 1) {
+      "Signal distribution has larger variance than noise distribution"
+    } else {
+      "Signal distribution has smaller variance than noise distribution"
+    }
+    
+    # Quality assessment
+    quality_assessment <- ""
+    expected_da <- 1.239
+    expected_intercept <- 1.072
+    expected_slope <- 0.7058
+    
+    if (abs(results$da - expected_da) < 0.05 && 
+        abs(results$intercept - expected_intercept) < 0.05 && 
+        abs(results$slope - expected_slope) < 0.05) {
+      quality_assessment <- "<div style='background-color: #d4edda; padding: 10px; border-radius: 5px; margin: 10px 0;'><strong>✓ Validation:</strong> Results closely match SDT Assistant benchmark values for Green & Swets (1966) data.</div>"
+    }
+    
+    HTML(paste0(
+      quality_assessment,
+      "<div style='background-color: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 4px solid #667eea;'>",
+      "<h5>Key Findings (UEV Model):</h5>",
+      "<ul style='margin-bottom: 15px;'>",
+      sprintf("<li><strong>Sensitivity:</strong> %s (da = %.3f)</li>", da_interp, results$da),
+      sprintf("<li><strong>Overall Performance:</strong> %s (AUC = %.3f)</li>", auc_interp, results$auc),
+      sprintf("<li><strong>Response Bias:</strong> %s (c = %.3f)</li>", bias_interp, results$criterion),
+      sprintf("<li><strong>Detection Rate:</strong> %.1f%% of 'A' stimuli correctly identified</li>", results$hit_rate * 100),
+      sprintf("<li><strong>False Alarm Rate:</strong> %.1f%% of 'Not A' stimuli incorrectly called 'A'</li>", results$fa_rate * 100),
+      sprintf("<li><strong>Distribution Variances:</strong> %s (slope = %.3f)</li>", slope_interp, results$slope),
+      "</ul>",
+      
+      "<h5>SDT Model Details:</h5>",
+      "<ul>",
+      "<li><strong>Model:</strong> Unequal-Variance Normal with Simultaneous MLE</li>",
+      "<li><strong>Parameters:</strong> 7 total (5 criteria + intercept + slope) estimated simultaneously</li>",
+      "<li><strong>Optimization:</strong> Multi-method approach for robust convergence</li>",
+      "</ul>",
+      "</div>"
+    ))
+  })
+}
+
+# =============================================================================
+# RUN THE APP
+# =============================================================================
+
+# Run the app
+shinyApp(ui = ui, server = server)
