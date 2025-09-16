@@ -143,15 +143,10 @@ Contributions are welcome! Please feel free to submit issues, feature requests, 
 
 ## Citation
 
-If you use this tool in your research, please consider citing:
 
 ```
 Green, D. M., & Swets, J. A. (1966). Signal detection theory and psychophysics. Wiley.
 ```
-
-## License
-
-[Include your chosen license here - MIT, GPL-3, etc.]
 
 ## Acknowledgments
 
