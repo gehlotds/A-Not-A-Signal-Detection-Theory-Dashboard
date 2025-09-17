@@ -12,7 +12,7 @@ library(htmlwidgets)
 library(numDeriv)
 
 # =============================================================================
-# UNEQUAL VARIANCE MLE IMPLEMENTATION - MATCHES SDT ASSISTANT
+# UNEQUAL VARIANCE MLE IMPLEMENTATION
 # =============================================================================
 
 fit_unequal_variance_mle <- function(s1_freqs, s2_freqs, max_iter = 100, tolerance = 1e-7) {
